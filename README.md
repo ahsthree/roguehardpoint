@@ -17,16 +17,28 @@ It uses the **same `hardpoint` map object** as the original [hardpoint plugin](h
    8
    ...
    1
-   The red hardpoint is LIVE! Hold it alone for 1 point per second (60 seconds).
+   The red hardpoint is LIVE! Hold it alone to score: 1 point every 1.0s for 60s.
    ```
 3. From the announcement onward, a star of sky shots fires inward at the hardpoint from 50 units above it, so players can see where to go.
 4. While it is live (`_rogueHardPointTime` seconds, default 60):
-   - **Exactly one** living rogue tank inside: that player gets **+1 personal score per second**.
+   - **Exactly one** living rogue tank inside: that player earns personal score. The rate depends on how many players are online (see [Scoring](#scoring)): 1 point per second with 10 or more players, down to 1 point per 10 seconds with only 2.
    - **Two or more** tanks inside: **contested**, so nobody scores.
    - **Nobody** inside: nobody scores.
 5. When time is up, the server announces who earned the most points, then waits for the next interval.
 
 The live window is a fixed clock. It never pauses or extends, so a contested hardpoint just burns time.
+
+## Spawning in the hardpoint
+
+While a hardpoint is announced or live, players who respawn can be placed **inside the hardpoint** instead of at a normal spawn point, for a chaotic fight. This is especially useful when the hardpoint is hard to reach, such as an upper deck that is only accessible by teleporter or jump pad.
+
+The plugin cannot check whether a random point is inside an obstacle, so it **learns safe spots** instead. Once a second it records where living, grounded rogue tanks are standing inside each hardpoint's footprint. Respawns pick from those spots, which are real, reachable positions at the right height, and the player spawns facing the hardpoint's center.
+
+- Spots in the outer band of the zone (`_rogueHardPointSpawnEdge`) are preferred, so spawns push inward instead of instantly contesting whoever is holding it.
+- Spots within `_rogueHardPointSpawnClear` units of a living tank are skipped.
+- Learning happens all the time, not just while a hardpoint is live, so a hardpoint is learned as soon as any tank has driven around in it. Spots are kept in memory only and are relearned after a server restart.
+- If a hardpoint has no learned spots yet, players spawn normally.
+- Set the hardpoint's `pos` z at the surface the tanks stand on (for example the deck top). Only tanks within `_rogueHardPointSpawnZTol` of that height are recorded, so tanks driving underneath a deck never become spawn spots.
 
 ## Requirements
 
@@ -92,6 +104,12 @@ Set these with `-set` on the command line, in a server config, or with `/set` in
 | `_rogueHardPointWarning` | `10` | Countdown seconds between the announcement and going live. `0` skips the countdown and goes live immediately. |
 | `_rogueHardPointFirstDelay` | `30` | Seconds after enough players join until the first hardpoint is announced. |
 | `_rogueHardPointMinPlayers` | `2` | Rogue players required on the server for the mode to run. |
+| `_rogueHardPointFullPlayers` | `10` | Rogue player count at or above which the rate is 1 point per second. |
+| `_rogueHardPointSlowSeconds` | `10` | Seconds per point at the minimum player count. |
+| `_rogueHardPointSpawnChance` | `100` | Percent of respawns placed inside the hardpoint while it is announced or live. `0` turns it off. |
+| `_rogueHardPointSpawnEdge` | `15` | Prefer spawn spots within this many units of the zone's edge. `0` means anywhere in the zone. |
+| `_rogueHardPointSpawnZTol` | `4` | Only learn spawn spots within this height of the hardpoint's `pos` z. |
+| `_rogueHardPointSpawnClear` | `8` | Skip spawn spots this close to a living tank. |
 | `_rogueHardPointStarSpokes` | `3` | Number of shots in the marker star, spaced evenly in a circle. |
 | `_rogueHardPointStarInterval` | `1.0` | Seconds between marker volleys. |
 
@@ -100,6 +118,16 @@ If `_rogueHardPointInterval` is shorter than the countdown plus live time, the n
 ## Scoring
 
 Points are added to the holder's **personal score** (wins). They are separate from kills, and the plugin does not touch team scores.
+
+The scoring rate scales with the number of rogue players online, so a quiet server doesn't hand out points as fast as a busy one, where there are more challengers:
+
+| Rogue players online | Rate | Max over a 60 s hardpoint |
+|----------------------|------|---------------------------|
+| 2 (the minimum) | 1 point per 10 seconds | 6 |
+| 6 | about 1 point per 1.8 seconds | about 33 |
+| 10 or more | 1 point per second | 60 |
+
+Between the minimum and `_rogueHardPointFullPlayers` the rate rises in a straight line. The rate is recalculated continuously, so players joining or leaving mid-hardpoint changes it immediately. Points are whole numbers; progress toward the next point resets if the holder leaves or the hardpoint becomes contested.
 
 ## Player count
 
