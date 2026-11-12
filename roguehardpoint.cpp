@@ -14,6 +14,7 @@
 //     pos 0 0 0
 //     size 30 30 30      # half-extents in x/y, height in z (same as a box)
 //     rot 45             # optional, degrees counterclockwise (also: rotation)
+//     spawn 70 0         # optional, repeatable: spawn spot x y [z], world coordinates
 //   end
 //
 // NOTE: both plugins register the HARDPOINT map object, so load only ONE of
@@ -31,11 +32,16 @@
 //     per 10 seconds at 2 players). Two or more = contested,
 //     nobody scores. Nobody inside = nobody scores. The clock never pauses.
 //   * While a hardpoint is announced or live, respawning players can be placed
-//     INSIDE it for a chaotic fight (great for a hard-to-reach upper deck). Safe
-//     spots are learned from where tanks have actually stood in the zone, so
-//     nobody spawns inside a wall. Edge spots are preferred, so spawns push
-//     inward instead of instantly contesting the holder. If a hardpoint has no
-//     learned spots yet, players spawn normally.
+//     near/inside it for a chaotic fight (great for a hard-to-reach upper deck).
+//     Every spot is checked for safety:
+//       1. `spawn x y [z]` lines in the hardpoint object win: one is picked at
+//          random and the player faces the hardpoint. You (or your map tool) pick
+//          these spots, so they are safe. z defaults to the hardpoint's z.
+//       2. Otherwise the plugin asks the server for spawn spots (bz_getStandardSpawn,
+//          which already checks buildings, ground, enemies and dangerous flags) and
+//          keeps the first one within _rogueHardPointSpawnRadius of the zone and
+//          within _rogueHardPointSpawnZTol of its height.
+//       3. If none qualifies, the server's normal spawn stands.
 //   * Nothing starts until _rogueHardPointMinPlayers rogue players are on the
 //     server, so one player can't farm points alone.
 //
@@ -50,13 +56,13 @@
 //                             per second                                     default 10
 //   _rogueHardPointSlowSeconds seconds per point at the minimum player count   default 10
 //   _rogueHardPointStarSpokes shots in the marker star                       default 3
-//   _rogueHardPointSpawnChance percent of respawns placed in the hardpoint while
+//   _rogueHardPointSpawnChance percent of respawns placed near the hardpoint while
 //                             it is announced/live (0 = off)                 default 100
-//   _rogueHardPointSpawnEdge  prefer spawn spots within this many units of the
-//                             zone's edge (0 = anywhere in the zone)         default 15
-//   _rogueHardPointSpawnZTol  only learn spots within this height of the
-//                             hardpoint's pos z (set pos z at the deck top)  default 4
-//   _rogueHardPointSpawnClear skip spots this close to a living tank         default 8
+//   _rogueHardPointSpawnRadius max distance from the zone for server-picked
+//                             spots (0 = never use near-hardpoint spawns)    default 100
+//   _rogueHardPointSpawnTries server spots tried before giving up            default 60
+//   _rogueHardPointSpawnZTol  server-picked spots must be within this height of
+//                             the hardpoint's pos z (set pos z at deck top)  default 4
 //   _rogueHardPointStarInterval seconds between marker volleys               default 1.0
 
 #include "bzfsAPI.h"
@@ -68,17 +74,18 @@
 #include <random>
 #include <cmath>
 
+// A map-placed spawn spot (spawn x y [z]); z defaults to the hardpoint's z.
+struct SpawnLine { float p[3]; bool hasZ; };
+
 struct Hardpoint {
     std::string name;
     float pos[3] = {0, 0, 0};
     float size[3] = {10, 10, 10};   // half-extents x/y, height z (box convention)
+    std::vector<SpawnLine> spawns;  // optional map-placed spawn spots
     float cosR = 1.0f, sinR = 0.0f; // rotation about z, set from `rot`
 };
 
 static std::vector<Hardpoint> g_points;
-
-// A position where a tank was really standing inside a hardpoint (a safe spawn).
-struct Spot { float p[3]; };
 
 // ---------------------------------------------------------------- map object
 // Identical parsing to hardpoint.cpp so the same maps work with both plugins.
@@ -108,6 +115,13 @@ public:
                 hp.cosR = cosf(r);
                 hp.sinR = sinf(r);
             }
+            else if (key == "spawn") {
+                SpawnLine sl = {{0, 0, 0}, false};
+                if (ss >> sl.p[0] >> sl.p[1]) {
+                    sl.hasZ = static_cast<bool>(ss >> sl.p[2]);
+                    hp.spawns.push_back(sl);
+                }
+            }
         }
         if (hp.name.empty())
             hp.name = std::to_string(g_points.size() + 1);
@@ -129,9 +143,6 @@ private:
     enum State { WAITING, WARNING, ACTIVE };
 
     HardpointMapHandler mapHandler;
-
-    std::vector<std::vector<Spot>> spots;   // learned safe spots, per hardpoint
-    double nextSample = 0;
     std::mt19937 rng;
 
     State  state = WAITING;
@@ -152,10 +163,8 @@ private:
 
     std::map<int, int> earned;  // points earned by player this activation
 
-    bool inFootprint(const Hardpoint &hp, const float *p, float &inset);
-    void addSpot(size_t h, const float *p);
-    void sampleSpots();
-    bool pickSpawn(size_t h, float *pos, float *rot);
+    float distToZone(const Hardpoint &hp, const float *p);
+    bool pickSpawn(size_t h, int playerId, float *pos, float *rot);
     void handleSpawn(bz_GetPlayerSpawnPosEventData_V1 *d);
     bool enoughPlayers();
     bool inside(const Hardpoint &hp, const float *p);
@@ -188,9 +197,9 @@ void RogueHardpointPlugin::Init(const char *) {
     ensureVar("_rogueHardPointFullPlayers",   10.0);
     ensureVar("_rogueHardPointSlowSeconds",   10.0);
     ensureVar("_rogueHardPointSpawnChance",  100.0);
-    ensureVar("_rogueHardPointSpawnEdge",     15.0);
+    ensureVar("_rogueHardPointSpawnRadius",  100.0);
+    ensureVar("_rogueHardPointSpawnTries",    60.0);
     ensureVar("_rogueHardPointSpawnZTol",      4.0);
-    ensureVar("_rogueHardPointSpawnClear",     8.0);
     ensureVar("_rogueHardPointStarSpokes",     3.0);
     ensureVar("_rogueHardPointStarInterval",   1.0);
 
@@ -204,7 +213,6 @@ void RogueHardpointPlugin::Init(const char *) {
 void RogueHardpointPlugin::Cleanup() {
     Flush();
     bz_removeCustomMapObject("HARDPOINT");
-    spots.clear();
     g_points.clear();
 }
 
@@ -274,115 +282,63 @@ double RogueHardpointPlugin::scoreRate() {
     return lo + t * (1.0 - lo);
 }
 
-// True if p is inside the hardpoint's x/y footprint (height ignored).
-// inset = how far in from the nearest footprint edge p is.
-bool RogueHardpointPlugin::inFootprint(const Hardpoint &hp, const float *p, float &inset) {
+// Horizontal distance from p to the hardpoint's footprint (0 if inside it).
+float RogueHardpointPlugin::distToZone(const Hardpoint &hp, const float *p) {
     const float dx = p[0] - hp.pos[0];
     const float dy = p[1] - hp.pos[1];
     const float lx =  dx * hp.cosR + dy * hp.sinR;
     const float ly = -dx * hp.sinR + dy * hp.cosR;
-    const float ix = hp.size[0] - fabsf(lx);
-    const float iy = hp.size[1] - fabsf(ly);
-    inset = (ix < iy) ? ix : iy;
-    return ix >= 0 && iy >= 0;
+    float ox = fabsf(lx) - hp.size[0];
+    float oy = fabsf(ly) - hp.size[1];
+    if (ox < 0) ox = 0;
+    if (oy < 0) oy = 0;
+    return sqrtf(ox * ox + oy * oy);
 }
 
-// Remember a spot where a tank stood (skips near-duplicates, keeps 300 max).
-void RogueHardpointPlugin::addSpot(size_t h, const float *p) {
-    std::vector<Spot> &pool = spots[h];
-    for (const Spot &s : pool) {
-        const float dx = s.p[0] - p[0], dy = s.p[1] - p[1], dz = s.p[2] - p[2];
-        if (dx * dx + dy * dy < 9.0f && fabsf(dz) < 2.0f) return;
+// Pick a safe spawn for playerId near hardpoint h. Returns false if there is
+// none, in which case the server's normal spawn is used.
+//
+// 1. `spawn` lines in the map win: random pick, facing the hardpoint. They were
+//    placed by you / your map tool, so they are safe.
+// 2. Otherwise ask the server (bz_getStandardSpawn) for spots. The server only
+//    returns spots it has already checked (inside buildings, ground, enemies,
+//    dangerous flags), and we keep the first one close enough to the zone and
+//    at the zone's height. Costs up to _rogueHardPointSpawnTries server calls.
+bool RogueHardpointPlugin::pickSpawn(size_t h, int playerId, float *pos, float *rot) {
+    const Hardpoint &hp = g_points[h];
+
+    if (!hp.spawns.empty()) {
+        const SpawnLine &sl = hp.spawns[rng() % hp.spawns.size()];
+        pos[0] = sl.p[0];
+        pos[1] = sl.p[1];
+        pos[2] = sl.hasZ ? sl.p[2] : hp.pos[2];
+        *rot = atan2f(hp.pos[1] - pos[1], hp.pos[0] - pos[0]);   // face the hardpoint
+        return true;
     }
-    Spot n = {{ p[0], p[1], p[2] }};
-    if (pool.size() < 300) pool.push_back(n);
-    else pool[rng() % pool.size()] = n;
-}
 
-// Once a second: learn where living, grounded rogue tanks are standing inside
-// each hardpoint's footprint, at the hardpoint's height (pos z +/- SpawnZTol).
-void RogueHardpointPlugin::sampleSpots() {
-    if (spots.size() != g_points.size()) spots.resize(g_points.size());
+    const double radius = bz_getBZDBDouble("_rogueHardPointSpawnRadius");
+    if (radius <= 0) return false;
+
+    int tries = (int)bz_getBZDBDouble("_rogueHardPointSpawnTries");
+    if (tries < 1) tries = 1;
     const float ztol = (float)bz_getBZDBDouble("_rogueHardPointSpawnZTol");
 
-    bz_APIIntList *players = bz_getPlayerIndexList();
-    if (!players) return;
-
-    for (unsigned int i = 0; i < players->size(); i++) {
-        bz_BasePlayerRecord *pr = bz_getPlayerByIndex(players->get(i));
-        if (!pr) continue;
-        if (pr->spawned && pr->team == eRogueTeam &&
-            fabsf(pr->lastKnownState.velocity[2]) < 0.5f) {
-            const float *p = pr->lastKnownState.pos;
-            for (size_t h = 0; h < g_points.size(); h++) {
-                float inset;
-                if (!inFootprint(g_points[h], p, inset)) continue;
-                if (fabsf(p[2] - g_points[h].pos[2]) > ztol) continue;
-                addSpot(h, p);
-            }
-        }
-        bz_freePlayerRecord(pr);
+    for (int i = 0; i < tries; i++) {
+        float p[3], r = 0;
+        if (!bz_getStandardSpawn(playerId, p, &r)) break;
+        if (distToZone(hp, p) > radius) continue;
+        if (fabsf(p[2] - hp.pos[2]) > ztol) continue;
+        pos[0] = p[0];
+        pos[1] = p[1];
+        pos[2] = p[2];
+        *rot = r;                                  // keep the server's chosen facing
+        return true;
     }
-    bz_deleteIntList(players);
-}
-
-// Choose a learned spot for hardpoint h: not near a living tank, preferring
-// the outer band of the zone. Returns false if there is no usable spot.
-bool RogueHardpointPlugin::pickSpawn(size_t h, float *pos, float *rot) {
-    if (h >= spots.size() || spots[h].empty()) return false;
-
-    const Hardpoint &hp = g_points[h];
-    const std::vector<Spot> &pool = spots[h];
-    float edge  = (float)bz_getBZDBDouble("_rogueHardPointSpawnEdge");
-    float clear = (float)bz_getBZDBDouble("_rogueHardPointSpawnClear");
-    if (edge < 0) edge = 0;
-    if (clear < 0) clear = 0;
-
-    std::vector<Spot> live;
-    bz_APIIntList *players = bz_getPlayerIndexList();
-    if (players) {
-        for (unsigned int i = 0; i < players->size(); i++) {
-            bz_BasePlayerRecord *pr = bz_getPlayerByIndex(players->get(i));
-            if (!pr) continue;
-            if (pr->spawned) {
-                Spot l = {{ pr->lastKnownState.pos[0],
-                            pr->lastKnownState.pos[1],
-                            pr->lastKnownState.pos[2] }};
-                live.push_back(l);
-            }
-            bz_freePlayerRecord(pr);
-        }
-        bz_deleteIntList(players);
-    }
-
-    std::vector<size_t> band, any;
-    for (size_t i = 0; i < pool.size(); i++) {
-        const Spot &s = pool[i];
-        bool free = true;
-        for (const Spot &l : live) {
-            const float dx = s.p[0] - l.p[0], dy = s.p[1] - l.p[1], dz = s.p[2] - l.p[2];
-            if (dx * dx + dy * dy + dz * dz < clear * clear) { free = false; break; }
-        }
-        if (!free) continue;
-        any.push_back(i);
-        float inset = 0;
-        inFootprint(hp, s.p, inset);
-        if (edge > 0 && inset <= edge) band.push_back(i);
-    }
-
-    const std::vector<size_t> &choices = band.empty() ? any : band;
-    if (choices.empty()) return false;
-
-    const Spot &s = pool[choices[rng() % choices.size()]];
-    pos[0] = s.p[0];
-    pos[1] = s.p[1];
-    pos[2] = s.p[2] + 0.5f;                          // settle onto the surface
-    *rot = atan2f(hp.pos[1] - s.p[1], hp.pos[0] - s.p[0]);   // face the center
-    return true;
+    return false;
 }
 
 // Server asks where a player should spawn: while a hardpoint is announced or
-// live, put (a percentage of) respawns inside it.
+// live, put (a percentage of) respawns near it.
 void RogueHardpointPlugin::handleSpawn(bz_GetPlayerSpawnPosEventData_V1 *d) {
     if (state != WARNING && state != ACTIVE) return;
     if (d->team != eRogueTeam) return;
@@ -391,8 +347,8 @@ void RogueHardpointPlugin::handleSpawn(bz_GetPlayerSpawnPosEventData_V1 *d) {
     if (chance <= 0) return;
     if (chance < 100 && (int)(rng() % 100) >= chance) return;
 
-    float pos[3], rot;
-    if (!pickSpawn((size_t)active, pos, &rot)) return;
+    float pos[3], rot = 0;
+    if (!pickSpawn((size_t)active, d->playerID, pos, &rot)) return;
 
     d->pos[0] = pos[0];
     d->pos[1] = pos[1];
@@ -521,12 +477,6 @@ void RogueHardpointPlugin::Event(bz_EventData *eventData) {
     if (eventData->eventType != bz_eTickEvent) return;
 
     const double now = bz_getCurrentTime();
-
-    // ---- learn safe spawn spots (always, so a hardpoint is learned before it runs)
-    if (now >= nextSample) {
-        nextSample = now + 1.0;
-        sampleSpots();
-    }
 
     // ---- need enough rogue players; cancel anything running if they leave
     if (!enoughPlayers()) {
