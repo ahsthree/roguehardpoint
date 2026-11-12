@@ -28,17 +28,33 @@ It uses the **same `hardpoint` map object** as the original [hardpoint plugin](h
 
 The live window is a fixed clock. It never pauses or extends, so a contested hardpoint just burns time.
 
-## Spawning in the hardpoint
+## Spawning near the hardpoint
 
-While a hardpoint is announced or live, players who respawn can be placed **inside the hardpoint** instead of at a normal spawn point, for a chaotic fight. This is especially useful when the hardpoint is hard to reach, such as an upper deck that is only accessible by teleporter or jump pad.
+While a hardpoint is announced or live, players who respawn can be placed **at or near the hardpoint** instead of at a normal spawn point, for a chaotic fight. This is especially useful when the hardpoint is hard to reach, such as an upper deck that is only accessible by teleporter or jump pad.
 
-The plugin cannot check whether a random point is inside an obstacle, so it **learns safe spots** instead. Once a second it records where living, grounded rogue tanks are standing inside each hardpoint's footprint. Respawns pick from those spots, which are real, reachable positions at the right height, and the player spawns facing the hardpoint's center.
+The server never accepts a spawn spot without checking it (it rejects spots inside objects, finds solid ground, and avoids spots in front of dangerous tanks). A plugin that picks its own random point skips all of that, so this plugin only uses spots that are already safe:
 
-- Spots in the outer band of the zone (`_rogueHardPointSpawnEdge`) are preferred, so spawns push inward instead of instantly contesting whoever is holding it.
-- Spots within `_rogueHardPointSpawnClear` units of a living tank are skipped.
-- Learning happens all the time, not just while a hardpoint is live, so a hardpoint is learned as soon as any tank has driven around in it. Spots are kept in memory only and are relearned after a server restart.
-- If a hardpoint has no learned spots yet, players spawn normally.
-- Set the hardpoint's `pos` z at the surface the tanks stand on (for example the deck top). Only tanks within `_rogueHardPointSpawnZTol` of that height are recorded, so tanks driving underneath a deck never become spawn spots.
+1. **`spawn` lines in the map win.** If the active hardpoint has any, a player spawns at one of them at random, facing the hardpoint. You (or your map tool) picked the spots, so they are safe. `z` defaults to the hardpoint's `pos` z.
+   ```
+   hardpoint
+     name red
+     pos 0 0 0
+     size 30 30 30
+     spawn 70 0
+     spawn -70 0
+     spawn 0 70
+     spawn 0 -70
+   end
+   ```
+2. **Otherwise it asks the server for spots.** `bz_getStandardSpawn` returns spots the server has already checked. The plugin keeps the first one that is within `_rogueHardPointSpawnRadius` of the zone and within `_rogueHardPointSpawnZTol` of the hardpoint's height, trying up to `_rogueHardPointSpawnTries` times. The spot keeps the server's chosen facing.
+3. **If none qualifies, the server's normal spawn stands.** Nobody is placed somewhere unchecked.
+
+Things to know:
+
+- The server picks spots across most of the map, so on a large map with a small radius, many respawns will use the normal spawn. Raise the tries or the radius, or add `spawn` lines.
+- Set the hardpoint's `pos` z at the surface the tanks stand on (for example the deck top). Server-picked spots are only used if they are near that height, so a spot on the ground below an upper deck is rejected. If the server rarely returns deck-level spots, use `spawn` lines on the deck.
+- Each respawn can use up to the server's `_spawnMaxCompTime` per call, so a very high tries value could slow respawns.
+- On maps where players are sent to their team base when they respawn, `bz_getStandardSpawn` may keep returning base positions. Use `spawn` lines there.
 
 ## Requirements
 
@@ -75,6 +91,10 @@ hardpoint
   pos 0 0 0
   size 30 30 30      # half-extents in x/y, height in z (same as a box)
   rot 45             # optional, degrees counterclockwise (also: rotation)
+  spawn 70 0
+  spawn -70 0
+  spawn 0 70
+  spawn 0 -70
 end
 
 hardpoint
@@ -90,6 +110,7 @@ end
 | `pos` | Position (x y z) of the base of the zone. |
 | `size` | Half-extents in x and y, and full height in z, like a box. |
 | `rot` / `rotation` | Optional rotation about the z axis, in degrees counterclockwise. |
+| `spawn` | Optional, repeatable. `spawn x y` or `spawn x y z` (world coordinates) is a safe spot where players spawn while this hardpoint is announced or live. `z` defaults to the hardpoint's `pos` z. See [Spawning near the hardpoint](#spawning-near-the-hardpoint). |
 
 The zone is invisible to the plugin's rules but you will usually want a matching visual in the map (for example a semi-transparent box or mesh at the same `pos`, `size` and rotation) so players can see its edges.
 
@@ -106,12 +127,10 @@ Set these with `-set` on the command line, in a server config, or with `/set` in
 | `_rogueHardPointMinPlayers` | `2` | Rogue players required on the server for the mode to run. |
 | `_rogueHardPointFullPlayers` | `10` | Rogue player count at or above which the rate is 1 point per second. |
 | `_rogueHardPointSlowSeconds` | `10` | Seconds per point at the minimum player count. |
-| `_rogueHardPointSpawnChance` | `100` | Percent of respawns placed inside the hardpoint while it is announced or live. `0` turns it off. |
-| `_rogueHardPointSpawnEdge` | `15` | Prefer spawn spots within this many units of the zone's edge. `0` means anywhere in the zone. |
-| `_rogueHardPointSpawnZTol` | `4` | Only learn spawn spots within this height of the hardpoint's `pos` z. |
-| `_rogueHardPointSpawnClear` | `8` | Skip spawn spots this close to a living tank. |
-| `_rogueHardPointStarSpokes` | `3` | Number of shots in the marker star, spaced evenly in a circle. |
-| `_rogueHardPointStarInterval` | `1.0` | Seconds between marker volleys. |
+| `_rogueHardPointSpawnChance` | `100` | Percent of respawns placed near the hardpoint while it is announced or live. `0` turns it off. |
+| `_rogueHardPointSpawnRadius` | `100` | How far from the zone a server-picked spawn spot may be. `0` turns near-hardpoint spawning off completely, so players get the server's normal spawns. |
+| `_rogueHardPointSpawnTries` | `60` | How many server-picked spots to try before giving up and using the normal spawn. |
+| `_rogueHardPointSpawnZTol` | `4` | Server-picked spots must be within this height of the hardpoint's `pos` z. |
 
 If `_rogueHardPointInterval` is shorter than the countdown plus live time, the next hardpoint starts one second after the previous one ends.
 
