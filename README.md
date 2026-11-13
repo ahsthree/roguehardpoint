@@ -17,16 +17,17 @@ It uses the **same `hardpoint` map object** as the original [hardpoint plugin](h
    8
    ...
    1
-   The red hardpoint is LIVE! Hold it alone to score: 1 point every 1.0s for 60s.
+   The red hardpoint is LIVE! The 60 second countdown starts when a tank enters. Hold it alone to score: 1 point every 1.0s.
    ```
 3. From the announcement onward, a star of sky shots fires inward at the hardpoint from 50 units above it, so players can see where to go.
-4. While it is live (`_rogueHardPointTime` seconds, default 60):
-   - **Exactly one** living rogue tank inside: that player earns personal score. The rate depends on how many players are online (see [Scoring](#scoring)): 1 point per second with 10 or more players, down to 1 point per 10 seconds with only 2.
-   - **Two or more** tanks inside: **contested**, so nobody scores.
-   - **Nobody** inside: nobody scores.
-5. When time is up, the server announces who earned the most points, then waits for the next interval.
+4. Once it is live, **the hold countdown does not start until a tank enters**. The countdown is `_rogueHardPointTime` seconds of holding (default 60) and it only runs while it is held:
+   - **Exactly one** living rogue tank inside: the countdown runs and that player earns personal score. The rate depends on how many players are online (see [Scoring](#scoring)): 1 point per second with 10 or more players, down to 1 point per 10 seconds with only 2.
+   - **Two or more** tanks inside: **contested**. The countdown pauses and nobody scores.
+   - **Nobody** inside: the countdown pauses and nobody scores.
 
-The live window is a fixed clock. It never pauses or extends, so a contested hardpoint just burns time.
+   The server announces when the countdown starts, pauses (with the time left) and resumes, so the **last tank standing in the hardpoint runs it to completion**.
+5. When the countdown reaches zero, the server announces who earned the most points, then waits for the next interval.
+6. If nobody holds the hardpoint alone for `_rogueHardPointIdleTime` seconds (default 120), it closes, so a hardpoint that nobody takes (or that stays contested) can't block the schedule forever. Set it to `0` to never close.
 
 ## Spawning near the hardpoint
 
@@ -48,6 +49,18 @@ The server never accepts a spawn spot without checking it (it rejects spots insi
    ```
 2. **Otherwise it asks the server for spots.** `bz_getStandardSpawn` returns spots the server has already checked. The plugin keeps the first one that is within `_rogueHardPointSpawnRadius` of the zone and within `_rogueHardPointSpawnZTol` of the hardpoint's height, trying up to `_rogueHardPointSpawnTries` times. The spot keeps the server's chosen facing.
 3. **If none qualifies, the server's normal spawn stands.** Nobody is placed somewhere unchecked.
+
+**Three tries per player.** Each hardpoint spawn counts as one try. A player gets `_rogueHardPointMaxSpawns` tries (default 3) per hardpoint. After the last one they respawn at the server's normal spawns for the rest of that hardpoint, so the zone can't turn into endless chaos where nobody can win. Tries reset when the next hardpoint is announced.
+
+The player is told privately each time, for example:
+
+```
+Hardpoint try 1 of 3 (2 left)
+Hardpoint try 3 of 3 - LAST TRY! After you die you respawn normally.
+No hardpoint tries left - you respawn normally.
+```
+
+Only a real hardpoint spawn costs a try. If no safe spot is found and the server's normal spawn is used, the try is not used. Players who are out of tries can still drive to the hardpoint from a normal spawn.
 
 Things to know:
 
@@ -121,7 +134,9 @@ Set these with `-set` on the command line, in a server config, or with `/set` in
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `_rogueHardPointInterval` | `300` | Seconds between activations, measured start to start. |
-| `_rogueHardPointTime` | `60` | Seconds a hardpoint stays live. |
+| `_rogueHardPointTime` | `60` | Seconds of holding needed to finish a hardpoint. The countdown starts when a tank enters and is paused while contested or empty. |
+| `_rogueHardPointIdleTime` | `120` | Close the hardpoint if nobody has held it alone for this many seconds. `0` means never. |
+| `_rogueHardPointMaxSpawns` | `3` | Hardpoint spawn tries per player per hardpoint. `0` means unlimited. |
 | `_rogueHardPointWarning` | `10` | Countdown seconds between the announcement and going live. `0` skips the countdown and goes live immediately. |
 | `_rogueHardPointFirstDelay` | `30` | Seconds after enough players join until the first hardpoint is announced. |
 | `_rogueHardPointMinPlayers` | `2` | Rogue players required on the server for the mode to run. |
@@ -129,7 +144,7 @@ Set these with `-set` on the command line, in a server config, or with `/set` in
 | `_rogueHardPointSlowSeconds` | `10` | Seconds per point at the minimum player count. |
 | `_rogueHardPointSpawnChance` | `100` | Percent of respawns placed near the hardpoint while it is announced or live. `0` turns it off. |
 | `_rogueHardPointSpawnRadius` | `100` | How far from the zone a server-picked spawn spot may be. `0` turns near-hardpoint spawning off completely, so players get the server's normal spawns. |
-| `_rogueHardPointSpawnTries` | `60` | How many server-picked spots to try before giving up and using the normal spawn. |
+| `_rogueHardPointSpawnTries` | `60` | How many server-picked spots to try before giving up and using the normal spawn (not the same as the per-player tries above). |
 | `_rogueHardPointSpawnZTol` | `4` | Server-picked spots must be within this height of the hardpoint's `pos` z. |
 
 If `_rogueHardPointInterval` is shorter than the countdown plus live time, the next hardpoint starts one second after the previous one ends.
