@@ -26,11 +26,13 @@
 //     name and the sky-shot star starts firing 50 units above it.
 //   * A visible countdown (10, 9, 8 ... 1, one number per line) runs for
 //     _rogueHardPointWarning seconds, then the hardpoint goes live.
-//   * It stays live for _rogueHardPointTime seconds. While it is live, exactly ONE
-//     living rogue tank inside earns personal score at a rate that scales with
-//     the number of rogue players online (1 point/second at 10+ players, 1 point
-//     per 10 seconds at 2 players). Two or more = contested,
-//     nobody scores. Nobody inside = nobody scores. The clock never pauses.
+//   * Once live, the _rogueHardPointTime-second HOLD COUNTDOWN does not start until
+//     a tank enters. It runs only while exactly ONE living rogue tank is inside;
+//     that tank earns personal score at a rate that scales with the number of
+//     rogue players online (1 point/second at 10+ players, 1 point per 10 seconds
+//     at 2 players). Two or more tanks = contested: countdown paused, nobody
+//     scores. Empty = paused too. The last tank standing runs it to completion.
+//     If nobody holds it for _rogueHardPointIdleTime seconds, it closes.
 //   * While a hardpoint is announced or live, respawning players can be placed
 //     near/inside it for a chaotic fight (great for a hard-to-reach upper deck).
 //     Every spot is checked for safety:
@@ -42,12 +44,16 @@
 //          keeps the first one within _rogueHardPointSpawnRadius of the zone and
 //          within _rogueHardPointSpawnZTol of its height.
 //       3. If none qualifies, the server's normal spawn stands.
+//     Each player gets _rogueHardPointMaxSpawns tries per hardpoint (default 3).
+//     They are told how many they have used, and once they are out they respawn
+//     normally, so the zone can't turn into endless chaos.
 //   * Nothing starts until _rogueHardPointMinPlayers rogue players are on the
 //     server, so one player can't farm points alone.
 //
 // BZDB variables:
 //   _rogueHardPointInterval   seconds between activations, start to start   default 300
-//   _rogueHardPointTime       seconds a hardpoint stays live                 default 60
+//   _rogueHardPointTime       seconds of holding needed to finish; starts when a
+//                             tank enters, paused while contested or empty   default 60
 //   _rogueHardPointWarning    countdown seconds before it goes live (0=off)  default 10
 //   _rogueHardPointFirstDelay seconds after enough players join until the
 //                             first activation                               default 30
@@ -56,6 +62,10 @@
 //                             per second                                     default 10
 //   _rogueHardPointSlowSeconds seconds per point at the minimum player count   default 10
 //   _rogueHardPointStarSpokes shots in the marker star                       default 3
+//   _rogueHardPointIdleTime   close the hardpoint if nobody has held it alone for
+//                             this many seconds (0 = never)                  default 120
+//   _rogueHardPointMaxSpawns  hardpoint spawn tries per player per hardpoint
+//                             (0 = unlimited)                                default 3
 //   _rogueHardPointSpawnChance percent of respawns placed near the hardpoint while
 //                             it is announced/live (0 = off)                 default 100
 //   _rogueHardPointSpawnRadius max distance from the zone for server-picked
@@ -153,15 +163,19 @@ private:
     double cycleStart = 0;      // when the current activation was announced
     double nextStart = 0;       // when the next activation is announced
     double warnEnd = 0;         // when the countdown ends
-    double activeEnd = 0;       // when the live period ends
+    double holdLeft = 0;        // seconds of holding left (runs only while one tank holds it)
+    double idle = 0;            // seconds the hardpoint has gone without a lone holder
+    bool   holdStarted = false; // a tank has entered, so the hold countdown has begun
     double lastStep = 0;
     double nextPulse = 0;
     double pointAccum = 0;      // progress toward the next point
+    int    accumOwner = -1;     // player the progress belongs to
     int    lastCount = -1;      // last countdown number shown
     int    lastHolder = -1;     // -1 empty, -2 contested, otherwise player id
     float  spin = 0;
 
     std::map<int, int> earned;  // points earned by player this activation
+    std::map<int, int> spawnsUsed;  // hardpoint spawn tries used by player this activation
 
     float distToZone(const Hardpoint &hp, const float *p);
     bool pickSpawn(size_t h, int playerId, float *pos, float *rot);
@@ -173,7 +187,7 @@ private:
     void pickHardpoint();
     void startWarning(double now);
     void goLive(double now);
-    void endActive(double now);
+    void endActive(double now, bool idleClose);
     void cancel(const char *why);
     void award(int playerId);
     void pulseStar();
@@ -200,6 +214,8 @@ void RogueHardpointPlugin::Init(const char *) {
     ensureVar("_rogueHardPointSpawnRadius",  100.0);
     ensureVar("_rogueHardPointSpawnTries",    60.0);
     ensureVar("_rogueHardPointSpawnZTol",      4.0);
+    ensureVar("_rogueHardPointIdleTime",     120.0);
+    ensureVar("_rogueHardPointMaxSpawns",      3.0);
     ensureVar("_rogueHardPointStarSpokes",     3.0);
     ensureVar("_rogueHardPointStarInterval",   1.0);
 
@@ -347,8 +363,31 @@ void RogueHardpointPlugin::handleSpawn(bz_GetPlayerSpawnPosEventData_V1 *d) {
     if (chance <= 0) return;
     if (chance < 100 && (int)(rng() % 100) >= chance) return;
 
+    // Each player gets a limited number of hardpoint spawns per hardpoint.
+    const int maxSpawns = (int)bz_getBZDBDouble("_rogueHardPointMaxSpawns");
+    int &used = spawnsUsed[d->playerID];
+    if (maxSpawns > 0 && used >= maxSpawns) {
+        if (used == maxSpawns) {        // tell them once, then stay quiet
+            used++;
+            bz_sendTextMessage(BZ_SERVER, d->playerID,
+                "No hardpoint tries left - you respawn normally.");
+        }
+        return;
+    }
+
     float pos[3], rot = 0;
     if (!pickSpawn((size_t)active, d->playerID, pos, &rot)) return;
+
+    used++;                             // only a real hardpoint spawn costs a try
+    if (maxSpawns > 0) {
+        if (used >= maxSpawns)
+            bz_sendTextMessagef(BZ_SERVER, d->playerID,
+                "Hardpoint try %d of %d - LAST TRY! After you die you respawn normally.",
+                used, maxSpawns);
+        else
+            bz_sendTextMessagef(BZ_SERVER, d->playerID,
+                "Hardpoint try %d of %d (%d left)", used, maxSpawns, maxSpawns - used);
+    }
 
     d->pos[0] = pos[0];
     d->pos[1] = pos[1];
@@ -369,6 +408,7 @@ void RogueHardpointPlugin::pickHardpoint() {
 
 void RogueHardpointPlugin::startWarning(double now) {
     cycleStart = now;
+    spawnsUsed.clear();
     pickHardpoint();
 
     const double warn = bz_getBZDBDouble("_rogueHardPointWarning");
@@ -391,19 +431,26 @@ void RogueHardpointPlugin::startWarning(double now) {
 void RogueHardpointPlugin::goLive(double now) {
     state = ACTIVE;
     const double t = bz_getBZDBDouble("_rogueHardPointTime");
-    activeEnd = now + t;
+    holdLeft = t;
+    idle = 0;
+    holdStarted = false;
     lastStep = now;
     pointAccum = 0;
+    accumOwner = -1;
     lastHolder = -1;
     earned.clear();
 
     bz_sendTextMessagef(BZ_SERVER, BZ_ALLUSERS,
-        "The %s hardpoint is LIVE! Hold it alone to score: 1 point every %.1fs for %.0fs.",
-        g_points[active].name.c_str(), 1.0 / scoreRate(), t);
+        "The %s hardpoint is LIVE! The %.0f second countdown starts when a tank enters. Hold it alone to score: 1 point every %.1fs.",
+        g_points[active].name.c_str(), t, 1.0 / scoreRate());
 }
 
-void RogueHardpointPlugin::endActive(double now) {
+void RogueHardpointPlugin::endActive(double now, bool idleClose) {
     state = WAITING;
+
+    if (idleClose)
+        bz_sendTextMessage(BZ_SERVER, BZ_ALLUSERS,
+            "Nobody held the hardpoint long enough - closing it.");
 
     int bestId = -1, best = 0;
     for (const auto &e : earned) {
@@ -521,42 +568,68 @@ void RogueHardpointPlugin::Event(bz_EventData *eventData) {
             pulseStar();
         }
 
-        const double stepNow = (now < activeEnd) ? now : activeEnd;
-        double dt = stepNow - lastStep;
-        if (dt >= 0.1 || (now >= activeEnd && dt > 0.0)) {                       // game step: 10 per second
+        double dt = now - lastStep;
+        if (dt >= 0.1) {                       // game step: 10 per second
             if (dt > 1.0) dt = 1.0;
-            lastStep = stepNow;
+            lastStep = now;
 
             int holder = -1;
             int count = tanksInZone(holder);
 
-            if (count >= 2) {                  // contested: nobody scores
+            if (count >= 2) {                  // contested: countdown paused, nobody scores
                 if (lastHolder != -2) {
-                    bz_sendTextMessage(BZ_SERVER, BZ_ALLUSERS, "Hardpoint contested!");
+                    if (holdStarted)
+                        bz_sendTextMessagef(BZ_SERVER, BZ_ALLUSERS,
+                            "Hardpoint contested! Countdown paused with %.0fs left.",
+                            ceil(holdLeft));
+                    else
+                        bz_sendTextMessage(BZ_SERVER, BZ_ALLUSERS, "Hardpoint contested!");
                     lastHolder = -2;
                 }
-                pointAccum = 0;
-            } else if (count == 1) {           // one tank alone: 1 point/second
+                idle += dt;               // progress toward the next point is kept
+            } else if (count == 1) {           // one tank alone: countdown runs, it scores
                 if (holder != lastHolder) {
                     const char *cs = bz_getPlayerCallsign(holder);
-                    bz_sendTextMessagef(BZ_SERVER, BZ_ALLUSERS,
-                        "%s is holding the hardpoint", cs ? cs : "Unknown");
+                    if (!holdStarted) {
+                        holdStarted = true;
+                        bz_sendTextMessagef(BZ_SERVER, BZ_ALLUSERS,
+                            "%s entered the hardpoint - countdown started: %.0f seconds of holding to go!",
+                            cs ? cs : "Unknown", holdLeft);
+                    } else {
+                        bz_sendTextMessagef(BZ_SERVER, BZ_ALLUSERS,
+                            "%s is holding the hardpoint (%.0fs left)",
+                            cs ? cs : "Unknown", ceil(holdLeft));
+                    }
                     lastHolder = holder;
-                    pointAccum = 0;            // no partial credit across players
                 }
-                pointAccum += dt * scoreRate();
+                if (holder != accumOwner) {    // no partial credit across players
+                    accumOwner = holder;
+                    pointAccum = 0;
+                }
+                idle = 0;
+                const double used = (dt < holdLeft) ? dt : holdLeft;
+                holdLeft -= used;
+                pointAccum += used * scoreRate();
                 while (pointAccum >= 1.0 - 1e-6) {
                     pointAccum -= 1.0;
                     award(holder);
                 }
-            } else {                           // empty
+            } else {                           // empty: countdown paused
+                if (lastHolder != -1 && holdStarted)
+                    bz_sendTextMessagef(BZ_SERVER, BZ_ALLUSERS,
+                        "Hardpoint empty. Countdown paused with %.0fs left.", ceil(holdLeft));
                 lastHolder = -1;
-                pointAccum = 0;
+                idle += dt;
             }
         }
 
-        if (now >= activeEnd)
-            endActive(now);
+        if (holdStarted && holdLeft <= 1e-9) {
+            endActive(now, false);             // the countdown ran to completion
+        } else {
+            const double idleLimit = bz_getBZDBDouble("_rogueHardPointIdleTime");
+            if (idleLimit > 0 && idle >= idleLimit)
+                endActive(now, true);
+        }
         break;
     }
 
